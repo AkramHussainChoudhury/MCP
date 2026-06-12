@@ -1,0 +1,7 @@
+fastmcp
+langgraph
+langchain-groq
+langchain-mcp-adapters
+langsmith
+python-dotenv
+pytest
