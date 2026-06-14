@@ -3,6 +3,10 @@
 A natural language interface for Databricks lakehouse health monitoring.  
 Ask questions in plain English → LangGraph agent calls MCP tools → structured diagnosis.
 
+Built in two phases:
+- **Phase 1** — local mock data, stdio transport (learning / demo)
+- **Phase 2** — real Databricks workspace, HTTP/SSE transport, API key auth (production path)
+
 ---
 
 ## Architecture
@@ -14,8 +18,8 @@ User query (plain English)
 LangGraph ReAct Agent  (Groq llama-3.3-70b-versatile)
     │  reasons over tool results, max 3 rounds
     │
-    ▼  stdio (spawns subprocess, communicates via stdin/stdout)
-FastMCP Server  (server.py)
+    ▼  HTTP/SSE  +  Authorization: Bearer <MCP_API_KEY>
+FastMCP Server  (server.py)  — persistent HTTP service on :8000
     │
     ├── get_job_run_status     → job run history, failures, error messages
     ├── get_cluster_health     → CPU / memory / DBU utilisation per cluster
@@ -24,13 +28,33 @@ FastMCP Server  (server.py)
     ├── get_recent_queries     → failed / slow SQL queries from warehouse history
     └── get_lineage            → upstream / downstream table dependencies
     │
-    ▼
-mock_data.py  (swap for real Databricks SDK calls to go live)
+    ▼  auto-selected by DATABRICKS_HOST env var
+    ├── mock_data.py        (DATABRICKS_HOST not set → local synthetic data)
+    └── databricks_data.py  (DATABRICKS_HOST set     → real Databricks SDK + REST)
+              │
+              ▼  Authorization: Bearer <DATABRICKS_TOKEN>
+         Databricks REST API
     │
     ▼
 Structured diagnosis:
   ## What Happened / ## Root Cause / ## Blast Radius / ## Recommended Fix
 ```
+
+---
+
+## Authentication — Two Layers
+
+```
+agent.py ──[MCP_API_KEY]──▶ server.py ──[DATABRICKS_TOKEN]──▶ Databricks API
+           client → MCP auth              MCP server → Databricks auth
+```
+
+| Token | Purpose | Held by |
+|---|---|---|
+| `MCP_API_KEY` | Authenticates the agent to the MCP server | Both agent and server `.env` |
+| `DATABRICKS_TOKEN` | Authenticates the MCP server to Databricks | Server `.env` only — agent never sees it |
+
+The agent never holds the Databricks token. If the agent is compromised, the attacker cannot call Databricks directly.
 
 ---
 
@@ -41,10 +65,35 @@ Structured diagnosis:
 | LLM | `langchain-groq` — Groq llama-3.3-70b-versatile |
 | Agent | `langgraph` — ReAct prebuilt graph |
 | MCP client | `langchain-mcp-adapters` — MultiServerMCPClient |
-| MCP server | `fastmcp` — stdio transport |
+| MCP server | `fastmcp` — HTTP/SSE transport |
+| Databricks | `databricks-sdk` + `requests` |
 | Tracing | `langsmith` |
 | Config | `python-dotenv` |
 | Tests | `pytest` |
+
+---
+
+## Project Structure
+
+```
+MCP/
+├── mock_data.py          # Phase 1 — synthetic data mirroring Databricks REST schemas
+├── databricks_data.py    # Phase 2 — real Databricks SDK + REST API calls
+├── server.py             # FastMCP server — 6 tools, auto-selects data layer
+├── agent.py              # LangGraph ReAct agent — connects via HTTP/SSE
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py
+│   ├── test_cluster_health.py
+│   ├── test_dlt_health.py
+│   ├── test_table_stats.py
+│   ├── test_recent_queries.py
+│   └── test_lineage.py
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+```
 
 ---
 
@@ -62,7 +111,6 @@ cd MCP
 ```bash
 python -m venv venv
 source venv/bin/activate        # Linux / Mac
-# or
 .\venv\Scripts\Activate.ps1    # Windows PowerShell
 ```
 
@@ -78,23 +126,28 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Open `.env` and add your keys:
+---
 
+## Phase 1 — Mock Data (Demo / Learning)
+
+No Databricks account needed. Uses synthetic data with a realistic incident scenario seeded in.
+
+**`.env` — minimum required:**
 ```
-GROQ_API_KEY=your_groq_api_key_here          # required — get from console.groq.com/keys
-
-LANGCHAIN_TRACING_V2=true                    # optional — LangSmith tracing
-LANGCHAIN_API_KEY=your_langsmith_key_here    # optional — get from smith.langchain.com
-LANGCHAIN_PROJECT=databricks-observability   # optional — project name in LangSmith
+MCP_API_KEY=any-random-string-you-choose
+GROQ_API_KEY=your_groq_api_key          # get from console.groq.com/keys
 ```
 
-### 5. Run the agent
-
+**Terminal 1 — start the MCP server:**
 ```bash
-# Default query
-python agent.py
+python server.py
+# Server starts on http://127.0.0.1:8000
+# Serving mock data (DATABRICKS_HOST not set)
+```
 
-# Custom query
+**Terminal 2 — run the agent:**
+```bash
+python agent.py
 python agent.py "why did the aggregate_gold job fail this morning?"
 python agent.py "which tables urgently need OPTIMIZE?"
 python agent.py "what failed in the last hour and what is the blast radius?"
@@ -102,13 +155,70 @@ python agent.py "is the bronze_to_silver DLT pipeline healthy?"
 python agent.py "what is the blast radius if silver.events is down?"
 ```
 
-You do **not** need to start `server.py` separately — the agent spawns it automatically.
+---
 
-### 6. Run the tests
+## Phase 2 — Real Databricks Workspace
 
-```bash
-pytest tests/ -v
+**Additional `.env` keys required:**
+
 ```
+# MCP server auth — generate with:
+# python -c "import secrets; print(secrets.token_hex(32))"
+MCP_API_KEY=your_generated_key
+
+# Databricks workspace
+DATABRICKS_HOST=https://adb-xxxxxxxxxxxx.x.azuredatabricks.net
+DATABRICKS_TOKEN=dapi...          # Settings → Developer → Access tokens
+
+# SQL warehouse for DESCRIBE DETAIL / HISTORY queries
+DATABRICKS_WAREHOUSE_ID=abc123    # SQL Warehouses → your warehouse → Connection details
+
+# Default catalog and schema when listing all tables (optional)
+DATABRICKS_CATALOG=main
+DATABRICKS_SCHEMA=default
+```
+
+**Terminal 1 — start the MCP server:**
+```bash
+python server.py
+# Server starts on http://127.0.0.1:8000
+# Serving real Databricks data (DATABRICKS_HOST is set)
+```
+
+**Terminal 2 — run the agent:**
+```bash
+python agent.py "why did the aggregate_gold job fail this morning?"
+```
+
+The server auto-detects `DATABRICKS_HOST` and switches to `databricks_data.py`. No code changes needed.
+
+---
+
+## How the Data Layer Switch Works
+
+`server.py` selects the data layer at startup based on a single env var:
+
+```python
+if os.environ.get("DATABRICKS_HOST"):
+    import databricks_data as data   # real Databricks SDK calls
+else:
+    import mock_data as data         # local synthetic data
+```
+
+All 6 tool functions call `data.get_*()` — they don't know or care which layer is active.
+
+---
+
+## Real API Mapping (databricks_data.py)
+
+| Tool | Real Databricks API | Notes |
+|---|---|---|
+| `get_job_run_status` | `w.jobs.list_runs()` | Full SDK support |
+| `get_cluster_health` | `w.clusters.list/get()` + `w.clusters.events()` | State and events available; live CPU/memory requires Datadog / Azure Monitor |
+| `get_dlt_health` | `w.pipelines.get()` + `list_updates()` + `list_pipeline_events()` | Full SDK support |
+| `get_table_stats` | `w.tables.get()` + `DESCRIBE DETAIL` + `DESCRIBE HISTORY` via SQL | Requires `DATABRICKS_WAREHOUSE_ID` |
+| `get_recent_queries` | `w.query_history.list()` | Full SDK support |
+| `get_lineage` | `GET /api/2.0/lineage-tracking/table-lineage` | Direct REST — Unity Catalog must be enabled |
 
 ---
 
@@ -137,67 +247,39 @@ now reading stale data.
 
 ## Recommended Fix
 1. Run OPTIMIZE on prod_catalog.silver.events immediately to compact 28k files.
-2. Increase executor memory or enable autoscaling on etl-main-prod (currently
-   capped at 16 workers).
+2. Increase executor memory or enable autoscaling on etl-main-prod.
 3. Re-run the aggregate_gold job after OPTIMIZE completes.
 4. Schedule weekly OPTIMIZE + VACUUM on silver.events via a Databricks job.
 ```
 
 ---
 
-## Project Structure
+## Run the Tests
 
-```
-MCP/
-├── mock_data.py          # Data layer — mirrors Databricks REST API response schemas
-├── server.py             # FastMCP server — exposes 6 tools via stdio
-├── agent.py              # LangGraph ReAct agent — consumes MCP server
-├── tests/
-│   ├── __init__.py
-│   ├── conftest.py       # Shared IDs and constants
-│   ├── test_cluster_health.py
-│   ├── test_dlt_health.py
-│   ├── test_table_stats.py
-│   ├── test_recent_queries.py
-│   └── test_lineage.py
-├── requirements.txt
-├── .env.example
-├── .gitignore
-└── README.md
+```bash
+pytest tests/ -v
 ```
 
----
-
-## Going Live with Real Databricks
-
-Every function in `mock_data.py` maps to a real Databricks REST endpoint.
-Replace the function body — nothing else changes.
-
-```python
-# mock_data.py — before (mock)
-def get_job_run_status(job_name=None):
-    return {"runs": [...hardcoded...]}
-
-# mock_data.py — after (real)
-from databricks.sdk import WorkspaceClient
-
-def get_job_run_status(job_name=None):
-    w = WorkspaceClient()    # reads DATABRICKS_HOST + DATABRICKS_TOKEN from env
-    runs = w.jobs.list_runs(limit=10, expand_tasks=True)
-    return {"runs": [r.as_dict() for r in runs]}
-```
-
-`server.py` and `agent.py` require no changes.
+Tests validate the mock data layer contracts. The same tests run against the real data layer to verify the Databricks API returns the expected schema.
 
 ---
 
 ## Design Decisions
 
-**Why stdio transport?**  
-The agent and server run on the same machine. Stdio is the canonical MCP transport used by Claude Desktop, Cursor, and VS Code Copilot — the agent spawns `server.py` as a child process and communicates via stdin/stdout. Switching to a networked HTTP/SSE deployment is one line: `mcp.run(transport="sse", host="0.0.0.0", port=8000)`.
+**Why HTTP/SSE transport (Phase 2)?**  
+The server runs as a persistent service — multiple agents can connect simultaneously, and the server outlives any single agent run. Phase 1 used stdio (agent spawns server as a subprocess) which is simpler but single-client only.
+
+**Why two-layer authentication?**  
+`MCP_API_KEY` controls who can call the MCP server. `DATABRICKS_TOKEN` controls what the MCP server can do in Databricks. These are intentionally separate — the Databricks token never leaves the server.
+
+**Why auto-switch on `DATABRICKS_HOST`?**  
+Zero code changes between local demo and production. Set the env var and restart — the server switches data layers automatically.
 
 **Why max 3 tool-call rounds?**  
-Prevents runaway tool loops and keeps Groq token costs predictable. Enforced via LangGraph's `recursion_limit=8` (each round = 2 node transitions in the ReAct graph).
+Prevents runaway tool loops and keeps Groq token costs predictable. Enforced via LangGraph's `recursion_limit=8` (each round = 2 node transitions).
 
 **Why `temperature=0` on the LLM?**  
 Observability queries need deterministic, evidence-based answers — not creative ones.
+
+**Production path for auth:**  
+Replace API key with OAuth 2.0 (Azure AD / Okta). FastMCP supports JWT validation natively — configure `issuer` and `audience` and it validates tokens against the auth server's public keys automatically. Each agent gets its own service principal with scoped permissions (`read:jobs`, `read:clusters` etc.) and tokens that auto-expire and refresh.

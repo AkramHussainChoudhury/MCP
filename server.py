@@ -1,19 +1,48 @@
 """
 Databricks Pipeline Observability MCP Server
-Transport: stdio (default for FastMCP)
 
-Run standalone:
+Run as a persistent HTTP service:
     python server.py
+Clients connect to http://127.0.0.1:8000/sse
 
-The agent connects via stdio — it spawns this process and communicates
-over stdin/stdout using the MCP protocol. Do not add print() statements
-here; they would corrupt the protocol stream.
+Data layer is selected automatically:
+    DATABRICKS_HOST set   → databricks_data.py  (real Databricks SDK calls)
+    DATABRICKS_HOST unset → mock_data.py         (local synthetic data)
 """
 
 from __future__ import annotations
 
+import os
+
+from dotenv import load_dotenv
 from fastmcp import FastMCP
-import mock_data
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+load_dotenv()
+
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    """Reject any request that doesn't carry the correct Bearer token."""
+
+    async def dispatch(self, request, call_next):
+        expected_key = os.environ.get("MCP_API_KEY", "")
+        if not expected_key:
+            # MCP_API_KEY not set — warn but allow through (dev convenience)
+            return await call_next(request)
+
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header != f"Bearer {expected_key}":
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        return await call_next(request)
+
+# Auto-select data layer based on environment
+if os.environ.get("DATABRICKS_HOST"):
+    import databricks_data as data
+else:
+    import mock_data as data
+
 
 # ── Server definition ────────────────────────────────────────────────────────
 
@@ -42,15 +71,14 @@ def get_job_run_status(job_name: str | None = None) -> dict:
     - Which jobs are currently running
 
     Args:
-        job_name: Optional filter — one of 'ingest_raw', 'transform_silver',
-                  'aggregate_gold', 'ml_feature_eng'. Omit to get all jobs.
+        job_name: Optional job name filter. Omit to get runs across all jobs.
 
     Returns:
         dict with key 'runs': list of run objects each containing job_name,
         state (life_cycle_state, result_state, state_message), timing in ms,
         cluster_instance, and per-task error details.
     """
-    return mock_data.get_job_run_status(job_name=job_name)
+    return data.get_job_run_status(job_name=job_name)
 
 
 # ── Tool 2: Cluster health ───────────────────────────────────────────────────
@@ -66,11 +94,6 @@ def get_cluster_health(cluster_id: str | None = None) -> dict:
     - DBU consumption
     - High GC time or task failure rates
 
-    Known cluster IDs:
-        etl_main    → '0601-084523-reef412'
-        ml_training → '0601-091200-teal889'
-        adhoc_sql   → '0601-072100-sand301'
-
     Args:
         cluster_id: Optional Databricks cluster ID string to filter to one cluster.
                     Omit to get all clusters.
@@ -81,7 +104,7 @@ def get_cluster_health(cluster_id: str | None = None) -> dict:
         cpu_percent, memory_percent, gc_time_percent, dbu_consumed_last_hour,
         active_tasks, failed_tasks_last_hour.
     """
-    return mock_data.get_cluster_health(cluster_id=cluster_id)
+    return data.get_cluster_health(cluster_id=cluster_id)
 
 
 # ── Tool 3: DLT pipeline health ──────────────────────────────────────────────
@@ -97,10 +120,6 @@ def get_dlt_health(pipeline_id: str | None = None) -> dict:
     - Specific DLT flow errors (e.g., write conflicts, schema issues)
     - The most recent pipeline update status
 
-    Known pipeline IDs:
-        bronze_to_silver → 'ple-8f3a2c11-4d90-47b1-a2e5-9b0f3c8d1e4f'
-        silver_to_gold   → 'ple-2d7b9e44-1a23-4c56-8f01-3d2e7a9b5c0d'
-
     Args:
         pipeline_id: Optional DLT pipeline ID string. Omit to get all pipelines.
 
@@ -110,7 +129,7 @@ def get_dlt_health(pipeline_id: str | None = None) -> dict:
         backlog_files, processing_rate_mb_per_sec), and a list of recent events
         with level (INFO/WARN/ERROR) and message.
     """
-    return mock_data.get_dlt_health(pipeline_id=pipeline_id)
+    return data.get_dlt_health(pipeline_id=pipeline_id)
 
 
 # ── Tool 4: Delta table stats ────────────────────────────────────────────────
@@ -125,13 +144,7 @@ def get_table_stats(table_name: str | None = None) -> dict:
     - Why a query on a table is slow (too many small files)
     - Whether a table needs OPTIMIZE or VACUUM
     - Table size, row count, or partition layout
-    - How fragmented a Delta table is (fragmentation_score 0.0–1.0)
-
-    Known tables (fully-qualified):
-        'prod_catalog.silver.events'
-        'prod_catalog.gold.kpi_daily'
-        'prod_catalog.bronze.raw_clickstream'
-        'prod_catalog.silver.user_profiles'
+    - How fragmented a Delta table is (fragmentation_score 0.0-1.0)
 
     Args:
         table_name: Optional fully-qualified table name (catalog.schema.table).
@@ -143,7 +156,7 @@ def get_table_stats(table_name: str | None = None) -> dict:
         last_vacuumed, fragmentation_score, and row_count_estimate.
         fragmentation_score > 0.6 indicates OPTIMIZE is urgently needed.
     """
-    return mock_data.get_table_stats(table_name=table_name)
+    return data.get_table_stats(table_name=table_name)
 
 
 # ── Tool 5: Recent SQL queries ───────────────────────────────────────────────
@@ -164,9 +177,9 @@ def get_recent_queries(
 
     Args:
         status_filter: Optional filter string.
-            'FAILED' → only queries that errored.
-            'SLOW'   → only FINISHED queries that took longer than 30 seconds.
-            Omit (None) → return all recent queries.
+            'FAILED' -> only queries that errored.
+            'SLOW'   -> only FINISHED queries that took longer than 30 seconds.
+            Omit (None) -> return all recent queries.
         limit: Max number of queries to return (default 20).
 
     Returns:
@@ -174,7 +187,7 @@ def get_recent_queries(
         status, query_text, user_name, duration_ms, error_message (if any),
         and a 'metrics' sub-dict with read_bytes, rows_read_count, num_tasks.
     """
-    return mock_data.get_recent_queries(status_filter=status_filter, limit=limit)
+    return data.get_recent_queries(status_filter=status_filter, limit=limit)
 
 
 # ── Tool 6: Table lineage ────────────────────────────────────────────────────
@@ -188,13 +201,7 @@ def get_lineage(table_name: str) -> dict:
     Use this tool AFTER identifying a root cause to quantify impact:
     - Which tables feed the broken table (upstream root causes)?
     - Which downstream tables and dashboards are now stale or broken?
-    - What is the blast radius score (1–10) for this table?
-
-    Known tables with lineage data:
-        'prod_catalog.bronze.raw_clickstream'
-        'prod_catalog.silver.events'
-        'prod_catalog.gold.kpi_daily'
-        'prod_catalog.silver.user_profiles'
+    - What is the blast radius score (1-10) for this table?
 
     Args:
         table_name: Fully-qualified table name (catalog.schema.table). Required.
@@ -203,15 +210,19 @@ def get_lineage(table_name: str) -> dict:
         dict containing:
         - upstreams: list of source tables/streams this table is derived from
         - downstreams: list of tables, jobs, and dashboards that consume this table
-        - blast_radius_score: int 1–10 (10 = maximum downstream impact)
+        - blast_radius_score: int 1-10 (10 = maximum downstream impact)
         - blast_radius_note: human-readable summary of the impact
     """
-    return mock_data.get_lineage(table_name=table_name)
+    return data.get_lineage(table_name=table_name)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # stdio transport: the agent process will spawn this script and communicate
-    # via stdin/stdout. FastMCP handles the MCP wire protocol automatically.
-    mcp.run(transport="stdio")
+    import uvicorn
+
+    # Build the ASGI app and attach the API key middleware
+    app = mcp.http_app(transport="sse")
+    app.add_middleware(APIKeyMiddleware)
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)

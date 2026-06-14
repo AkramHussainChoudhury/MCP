@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
@@ -79,16 +78,15 @@ Respond ONLY in this exact format — no extra text before or after:
 
 
 # ── MCP server config ────────────────────────────────────────────────────────
+# SSE transport: connects to the already-running server.py service.
+# Start the server first:  python server.py
+# Then run the agent:      python agent.py
 
-SERVER_PATH = Path(__file__).parent / "server.py"
-
-# MultiServerMCPClient expects typed connection dicts.
-# StdioConnection shape: transport, command, args (env is optional).
 MCP_CONFIG = {
     "databricks": {
-        "transport": "stdio",
-        "command": "python",
-        "args": [str(SERVER_PATH)],
+        "transport": "sse",
+        "url": "http://127.0.0.1:8000/sse",
+        "headers": {"Authorization": f"Bearer {os.environ.get('MCP_API_KEY', '')}"},
     }
 }
 

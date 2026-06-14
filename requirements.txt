@@ -5,3 +5,5 @@ langchain-mcp-adapters
 langsmith
 python-dotenv
 pytest
+databricks-sdk
+requests
