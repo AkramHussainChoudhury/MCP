@@ -264,6 +264,49 @@ Tests validate the mock data layer contracts. The same tests run against the rea
 
 ---
 
+## LangSmith Observability
+
+Every `run_query` call is wrapped with `@traceable` and appears as a named root span in LangSmith. All internal LangGraph node transitions and LLM calls are nested under it automatically.
+
+### What you see per trace
+
+```
+databricks-observability-query          ← root span (@traceable)
+│  Tags: mcp · data-layer:mock          ← filterable in the UI
+│  Total tokens: 4,821                  ← auto-aggregated by LangSmith
+│
+├── LangGraph: agent                    ← round 1 — LLM picks tools
+│   └── ChatGroq                        tokens: 1,204
+├── LangGraph: tools                    ← MCP tool results
+├── LangGraph: agent                    ← round 2 — LLM reasons further
+│   └── ChatGroq                        tokens: 2,891
+└── LangGraph: agent                    ← final answer
+    └── ChatGroq                        tokens:   726
+```
+
+### Navigating the UI
+
+| What you want | Where to look |
+|---|---|
+| Total tokens per query | Runs list → `Total Tokens` column |
+| Per-LLM-call token breakdown | Open a trace → click any `ChatGroq` node → **Token Usage** panel |
+| Aggregated total for the full run | Open a trace → click the root `databricks-observability-query` node → **Token Usage** panel |
+| Filter by data layer | Runs list → filter by tag `data-layer:mock` or `data-layer:databricks` |
+
+### Enabling tracing
+
+Add these to your `.env`:
+
+```
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=your_langsmith_api_key   # smith.langchain.com → Settings → API Keys
+LANGCHAIN_PROJECT=databricks-observability
+```
+
+LangChain picks these up automatically — no extra code needed beyond what is already in `agent.py`.
+
+---
+
 ## Design Decisions
 
 **Why HTTP/SSE transport (Phase 2)?**  

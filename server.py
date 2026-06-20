@@ -16,26 +16,45 @@ import os
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
 
 load_dotenv()
 
 
-class APIKeyMiddleware(BaseHTTPMiddleware):
-    """Reject any request that doesn't carry the correct Bearer token."""
+class APIKeyMiddleware:
+    """
+    Pure ASGI middleware for Bearer token auth.
 
-    async def dispatch(self, request, call_next):
+    BaseHTTPMiddleware buffers the full response body before forwarding it,
+    which breaks SSE (the connection stays open and streams events indefinitely).
+    A raw ASGI middleware passes scope/receive/send straight through with no
+    buffering, so SSE works correctly.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         expected_key = os.environ.get("MCP_API_KEY", "")
-        if not expected_key:
-            # MCP_API_KEY not set — warn but allow through (dev convenience)
-            return await call_next(request)
+        if expected_key:
+            headers = {k.lower(): v for k, v in scope.get("headers", [])}
+            auth = headers.get(b"authorization", b"").decode("utf-8", errors="replace")
+            if auth != f"Bearer {expected_key}":
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", b"24"),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": b'{"error":"Unauthorized"}'})
+                return
 
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header != f"Bearer {expected_key}":
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
-
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 # Auto-select data layer based on environment
 if os.environ.get("DATABRICKS_HOST"):
@@ -221,8 +240,8 @@ def get_lineage(table_name: str) -> dict:
 if __name__ == "__main__":
     import uvicorn
 
-    # Build the ASGI app and attach the API key middleware
-    app = mcp.http_app(transport="sse")
-    app.add_middleware(APIKeyMiddleware)
+    # Wrap directly — add_middleware uses Starlette's buffering stack
+    # which has the same SSE-breaking behaviour as BaseHTTPMiddleware.
+    app = APIKeyMiddleware(mcp.http_app(transport="sse"))
 
     uvicorn.run(app, host="127.0.0.1", port=8000)

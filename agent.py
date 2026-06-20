@@ -20,18 +20,14 @@ from langchain_core.messages import HumanMessage
 from langchain_groq import ChatGroq
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
+from langsmith import traceable
+from langsmith import Client as LangSmithClient
 from pydantic import SecretStr
 
 load_dotenv()
 
-
-# ── LangSmith tracing ────────────────────────────────────────────────────────
-# LangChain reads these env vars automatically — no extra code needed here.
-# Add to your .env file to enable:
-#
-#   LANGCHAIN_TRACING_V2=true
-#   LANGCHAIN_API_KEY=<your langsmith key>
-#   LANGCHAIN_PROJECT=databricks-observability
+# Tags every LangSmith trace so you can filter "mock vs real Databricks" in the UI.
+_data_layer = "databricks" if os.environ.get("DATABRICKS_HOST") else "mock"
 
 
 # ── LLM ─────────────────────────────────────────────────────────────────────
@@ -82,17 +78,26 @@ Respond ONLY in this exact format — no extra text before or after:
 # Start the server first:  python server.py
 # Then run the agent:      python agent.py
 
+_api_key = os.environ.get("MCP_API_KEY", "")
+
 MCP_CONFIG = {
     "databricks": {
         "transport": "sse",
         "url": "http://127.0.0.1:8000/sse",
-        "headers": {"Authorization": f"Bearer {os.environ.get('MCP_API_KEY', '')}"},
+        # Only add Authorization header if MCP_API_KEY is set.
+        # An empty Bearer token is an illegal HTTP header value.
+        **({"headers": {"Authorization": f"Bearer {_api_key}"}} if _api_key else {}),
     }
 }
 
 
 # ── Agent runner ─────────────────────────────────────────────────────────────
 
+@traceable(
+    name="databricks-observability-query",
+    tags=["mcp", f"data-layer:{_data_layer}"],
+    metadata={"model": "llama-3.3-70b-versatile", "recursion_limit": 8},
+)
 async def run_query(user_query: str) -> str:
     """Run one observability query and return the structured diagnosis."""
     client = MultiServerMCPClient(MCP_CONFIG)
